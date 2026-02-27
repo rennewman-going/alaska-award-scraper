@@ -90,9 +90,11 @@ def fmt_points(pts: int) -> str:
 # ── Form interaction ───────────────────────────────────────────────────────────
 SEARCH_BASE = "https://www.alaskaair.com/search/results"
 
+_datepicker_debug_saved = False
+
 async def fill_and_search(page, origin, dest, year, month):
     """
-    Navigate to the search form, fill it (Use points + Flexible dates +
+    Navigate to the search form, fill it (Flexible dates + Use points +
     1 passenger + departure month), and click Search flights.
     Returns True if the form was submitted.
     """
@@ -105,7 +107,7 @@ async def fill_and_search(page, origin, dest, year, month):
         pass
     await asyncio.sleep(4)
 
-    # Save a one-time snapshot of the raw form so selectors can be diagnosed
+    # Save a one-time snapshot of the raw form
     global _form_debug_saved
     if not _form_debug_saved:
         _form_debug_saved = True
@@ -117,131 +119,124 @@ async def fill_and_search(page, origin, dest, year, month):
         except Exception:
             pass
 
-    # ── Use points ────────────────────────────────────────────────────────────
-    for sel in [
-        "label:has-text('Use points')",
-        "text=Use points",
-        "[for*='point' i]",
-        "input[id*='point' i]",
-    ]:
+    # ── 1. Flexible dates ─────────────────────────────────────────────────────
+    # Try get_by_label first (most reliable), fall back to text click
+    try:
+        await page.get_by_label("Flexible dates").check(timeout=3000)
+    except Exception:
         try:
-            el = page.locator(sel).first
-            if await el.is_visible(timeout=2000):
-                await el.click()
-                await asyncio.sleep(0.4)
-                break
+            await page.locator("text=Flexible dates").click(timeout=3000)
         except Exception:
-            continue
+            pass
+    await asyncio.sleep(0.5)
 
-    # ── Flexible dates ────────────────────────────────────────────────────────
-    for sel in [
-        "label:has-text('Flexible dates')",
-        "text=Flexible dates",
-        "[for*='flexible' i]",
-        "input[id*='flexible' i]",
-    ]:
+    # ── 2. Use points ─────────────────────────────────────────────────────────
+    try:
+        await page.get_by_label("Use points").check(timeout=3000)
+    except Exception:
         try:
-            el = page.locator(sel).first
-            if await el.is_visible(timeout=2000):
-                await el.click()
-                await asyncio.sleep(0.4)
-                break
+            await page.locator("text=Use points").click(timeout=3000)
         except Exception:
-            continue
+            pass
+    await asyncio.sleep(0.5)
 
-    # ── Date: type the first day of the target month ──────────────────────────
-    # Try MM/DD/YYYY and YYYY-MM-DD; Alaska's input may accept either
-    for date_str in [
-        search_date.strftime("%-m/%-d/%Y"),   # 3/1/2026
-        search_date.strftime("%m/%d/%Y"),      # 03/01/2026
-        search_date.strftime("%Y-%m-%d"),      # 2026-03-01
-    ]:
-        for sel in [
-            "input[placeholder='Date']",
-            "input[placeholder*='ate' i]",
-            "input[aria-label*='eparture']",
-            "input[type='date']",
-            "[class*='date' i] input",
-        ]:
+    # ── 3. Date — click the Date button, navigate picker to target month ──────
+    # The Date field is a custom button (not a plain <input>).
+    global _datepicker_debug_saved
+    try:
+        await page.locator("button:has-text('Date')").first.click(timeout=3000)
+        await asyncio.sleep(1.5)
+
+        # Save one-time screenshot of the date picker
+        if not _datepicker_debug_saved:
+            _datepicker_debug_saved = True
             try:
-                inp = page.locator(sel).first
-                if await inp.is_visible(timeout=1000):
-                    await inp.click()
-                    await asyncio.sleep(0.2)
-                    await inp.press("Control+a")
-                    await inp.type(date_str, delay=40)
-                    await asyncio.sleep(0.2)
-                    val = await inp.input_value()
-                    if val:
-                        await page.keyboard.press("Escape")
+                await page.screenshot(path="debug_datepicker.png", full_page=False)
+                print("    📄 Saved debug_datepicker.png")
+            except Exception:
+                pass
+
+        # Navigate forward until the target month is visible
+        target = search_date.strftime("%B %Y")   # e.g. "March 2026"
+        for _ in range(18):
+            # Check if the target month header is on screen
+            try:
+                header = await page.locator(
+                    "[class*='month' i]:not(button), [aria-live='polite'], "
+                    "[class*='header' i][class*='calendar' i]"
+                ).first.inner_text(timeout=1000)
+                if target.lower() in header.lower():
+                    break
+            except Exception:
+                pass
+            # Click the Next / forward arrow in the date picker
+            for next_sel in [
+                "button[aria-label*='Next month' i]",
+                "button[aria-label='Next']",
+                "button[title*='Next' i]",
+                "button[class*='next' i]",
+            ]:
+                try:
+                    nxt = page.locator(next_sel).last
+                    if await nxt.is_visible(timeout=500):
+                        await nxt.click()
+                        await asyncio.sleep(0.4)
                         break
+                except Exception:
+                    continue
+
+        # Click day "1" (exact text match to avoid hitting "11", "21", "31")
+        day_cells = await page.locator(
+            "button[class*='day' i], td[class*='day' i], "
+            "[role='gridcell'], [class*='Day' i]:not([class*='disabled' i])"
+        ).all()
+        for cell in day_cells:
+            try:
+                if (await cell.inner_text()).strip() == "1":
+                    await cell.click()
+                    break
             except Exception:
                 continue
-        else:
-            continue
-        break
-    await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
+    except Exception as e:
+        print(f"(date picker: {e}) ", end="")
 
-    # ── Passengers: 0 → 1 adult ───────────────────────────────────────────────
-    for pax_sel in [
-        "button:has-text('0 adults')",
-        "button:has-text('Travelers')",
-        "button:has-text('Passengers')",
-        "[aria-label*='assenger' i]",
-        "[class*='passenger' i] button",
-    ]:
+    # ── 4. Passengers: 0 → 1 adult ───────────────────────────────────────────
+    try:
+        await page.locator("text=0 adults").click(timeout=3000)
+        await asyncio.sleep(0.8)
+        # Increment adult count
+        for inc_sel in [
+            "button[aria-label*='Add adult' i]",
+            "button[aria-label*='increase' i]",
+            "button:has-text('+') >> nth=0",
+        ]:
+            try:
+                inc = page.locator(inc_sel).first
+                if await inc.is_visible(timeout=1000):
+                    await inc.click()
+                    break
+            except Exception:
+                continue
+        await asyncio.sleep(0.4)
         try:
-            btn = page.locator(pax_sel).first
-            if await btn.is_visible(timeout=1500):
-                await btn.click()
-                await asyncio.sleep(0.5)
-                # Increment adult count by 1
-                for inc_sel in [
-                    "button[aria-label*='dd adult' i]",
-                    "button[aria-label*='ncrease adult' i]",
-                    "[class*='adult' i] button:has-text('+')",
-                    "button[class*='increment']",
-                    "button:has-text('+') >> nth=0",
-                ]:
-                    try:
-                        inc = page.locator(inc_sel).first
-                        if await inc.is_visible(timeout=1000):
-                            await inc.click()
-                            break
-                    except Exception:
-                        continue
-                await asyncio.sleep(0.3)
-                # Close passenger dropdown
-                for close_sel in [
-                    "button:has-text('Done')",
-                    "button:has-text('Apply')",
-                    "button:has-text('Close')",
-                ]:
-                    try:
-                        c = page.locator(close_sel).first
-                        if await c.is_visible(timeout=1000):
-                            await c.click()
-                            break
-                    except Exception:
-                        continue
-                else:
-                    await page.keyboard.press("Escape")
-                break
+            await page.locator("button:has-text('Done')").click(timeout=1500)
         except Exception:
-            continue
-    await asyncio.sleep(0.3)
+            await page.keyboard.press("Escape")
+    except Exception as e:
+        print(f"(passengers: {e}) ", end="")
+    await asyncio.sleep(0.5)
 
-    # ── Submit ────────────────────────────────────────────────────────────────
+    # ── 5. Submit ─────────────────────────────────────────────────────────────
+    # Use direct .click(timeout=) — avoids is_visible race conditions
     for submit_sel in [
         "button:has-text('Search flights')",
         "button[type='submit']",
         "button:has-text('Search')",
     ]:
         try:
-            btn = page.locator(submit_sel).first
-            if await btn.is_visible(timeout=1500):
-                await btn.click()
-                return True
+            await page.locator(submit_sel).first.click(timeout=4000)
+            return True
         except Exception:
             continue
 
