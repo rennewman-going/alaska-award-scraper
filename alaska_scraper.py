@@ -141,10 +141,16 @@ async def fill_and_search(page, origin, dest, year, month):
     await asyncio.sleep(0.5)
 
     # ── 3. Date — click the Date button, navigate picker to target month ──────
-    # The Date field is a custom button (not a plain <input>).
+    # The Date field is a custom web component, NOT a plain <button>.
     global _datepicker_debug_saved
     try:
-        await page.locator("button:has-text('Date')").first.click(timeout=3000)
+        await page.locator(
+            "[role='button']:has-text('Date'), "
+            "div[slot]:has-text('Date'), "
+            "[class*='date' i][class*='field' i], "
+            "[class*='date' i][class*='input' i], "
+            "[class*='date' i][class*='trigger' i]"
+        ).first.click(timeout=3000)
         await asyncio.sleep(1.5)
 
         # Save one-time screenshot of the date picker
@@ -202,8 +208,9 @@ async def fill_and_search(page, origin, dest, year, month):
         print(f"(date picker: {e}) ", end="")
 
     # ── 4. Passengers: 0 → 1 adult ───────────────────────────────────────────
+    # "text=0 adults" matches both the div and the slot — use the div[slot] directly
     try:
-        await page.locator("text=0 adults").click(timeout=3000)
+        await page.locator("div[slot='valueText']:has-text('0 adults')").click(timeout=3000)
         await asyncio.sleep(0.8)
         # Increment adult count
         for inc_sel in [
