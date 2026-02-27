@@ -178,97 +178,46 @@ async def fill_and_search(page, origin, dest, year, month):
         print(f"    📅 trigger='{trigger_text_pw[:40]}' pre_set={date_pre_set}")
 
         if not date_pre_set:
-            # Open the picker by clicking the parent component host
-            # (div[slot='trigger'] is slotted content; the host handles the click)
+            # ── Enumerate ALL [slot='trigger'] elements to identify the date one ──
+            # There are multiple on the page (date, passengers, etc.) — .first may
+            # be wrong. Print each one's parent tag and text content.
             try:
-                result = await trigger_loc.evaluate(
-                    "el => el.parentElement ? (el.parentElement.click(), el.parentElement.tagName) : 'no-parent'"
-                )
-                print(f"    📅 parent click: {result}")
+                all_triggers = await page.locator("[slot='trigger']").all()
+                print(f"    📅 total [slot='trigger']: {len(all_triggers)}")
+                for i, t in enumerate(all_triggers[:6]):
+                    try:
+                        info = await t.evaluate(
+                            "el => (el.parentElement ? el.parentElement.tagName : 'none')"
+                            " + ' | ' + el.textContent.trim().slice(0,25)"
+                        )
+                        print(f"    📅   [{i}] {info}")
+                    except Exception:
+                        pass
             except Exception as e:
-                print(f"    📅 parent click failed: {e}")
-            await asyncio.sleep(2)
+                print(f"    📅 trigger enum failed: {e}")
 
-            # Always save debug screenshot + HTML on first date attempt
+            # ── Probe for date-specific Auro elements ──
+            for probe_sel in ["auro-datepicker",
+                              "[aria-label*='depart' i]",
+                              "[aria-label*='date' i]",
+                              "input[type='date']"]:
+                try:
+                    n = await page.locator(probe_sel).count()
+                    if n:
+                        print(f"    📅 probe '{probe_sel}': {n}")
+                except Exception:
+                    pass
+
+            # ── Save debug screenshot + HTML (once) without clicking anything ──
             if not _datepicker_debug_saved:
                 _datepicker_debug_saved = True
                 try:
                     await page.screenshot(path="debug_datepicker.png", full_page=False)
-                    html_content = await page.content()
                     with open("debug_datepicker.html", "w") as fh:
-                        fh.write(html_content)
+                        fh.write(await page.content())
                     print("    📄 Saved debug_datepicker.png/.html")
                 except Exception:
                     pass
-
-            # Count Auro calendar cells to confirm picker is open
-            for day_sel in [
-                "auro-calendar-cell",
-                "[role='gridcell']",
-                "button[class*='day' i]",
-                "td[class*='day' i]",
-            ]:
-                try:
-                    n = await page.locator(day_sel).count()
-                    if n > 0:
-                        print(f"    📅 day cells via '{day_sel}': {n}")
-                        break
-                except Exception:
-                    continue
-            else:
-                day_sel = "auro-calendar-cell"
-                print("    📅 no day cells found — picker may not be open")
-
-            # Navigate to target month if needed
-            target_str = search_date.strftime("%B %Y").lower()
-            for _ in range(18):
-                # Collect visible month header texts
-                found_month = False
-                for h_sel in ["[aria-live]", "auro-calendar", "[class*='month-title' i]", "h2", "h3"]:
-                    try:
-                        for h in await page.locator(h_sel).all():
-                            ht = (await h.inner_text(timeout=300)).lower()
-                            if target_str in ht:
-                                found_month = True
-                                break
-                    except Exception:
-                        pass
-                    if found_month:
-                        break
-                if found_month:
-                    print(f"    📅 month found: {target_str}")
-                    break
-                # Click next-month button
-                for nxt in ["button[aria-label*='next month' i]",
-                            "button[aria-label='Next']",
-                            "button[class*='next' i]"]:
-                    try:
-                        await page.locator(nxt).last.click(timeout=800)
-                        await asyncio.sleep(0.5)
-                        break
-                    except Exception:
-                        continue
-
-            # Click day "1" — try Auro-specific selector first
-            day_clicked = False
-            for sel in ["auro-calendar-cell", "[role='gridcell']",
-                        "button[class*='day' i]", "td[class*='day' i]"]:
-                cells = await page.locator(sel).all()
-                for cell in cells:
-                    try:
-                        txt = (await cell.inner_text(timeout=300)).strip()
-                        if txt in ("1", "01"):
-                            await cell.click()
-                            day_clicked = True
-                            print(f"    📅 clicked day 1 via '{sel}'")
-                            break
-                    except Exception:
-                        continue
-                if day_clicked:
-                    break
-            if not day_clicked:
-                print("    📅 WARNING: day 1 not clicked")
-            await asyncio.sleep(0.5)
 
     except Exception as e:
         print(f"    (date step error: {e})")
