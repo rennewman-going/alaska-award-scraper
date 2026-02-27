@@ -92,6 +92,22 @@ SEARCH_BASE = "https://www.alaskaair.com/search/results"
 
 _datepicker_debug_saved = False
 
+# ── JavaScript helpers that pierce shadow DOM ──────────────────────────────────
+_JS_FIND = """
+function findDeep(root, selector) {
+    var el = root.querySelector(selector);
+    if (el) return el;
+    var all = root.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) {
+        if (all[i].shadowRoot) {
+            el = findDeep(all[i].shadowRoot, selector);
+            if (el) return el;
+        }
+    }
+    return null;
+}
+"""
+
 async def fill_and_search(page, origin, dest, year, month):
     """
     Navigate to the search form, fill it (Flexible dates + Use points +
@@ -99,13 +115,17 @@ async def fill_and_search(page, origin, dest, year, month):
     Returns True if the form was submitted.
     """
     search_date = date(year, month, 1)
-    url = f"{SEARCH_BASE}?O={origin}&D={dest}&RT=false"
+    date_str = f"{year}{month:02d}01"
+    # Include all known params — DT1/A/AT/FD may pre-populate date, passengers,
+    # award mode, and flexible dates, reducing how much UI interaction is needed.
+    url = (f"{SEARCH_BASE}?O={origin}&D={dest}&RT=false"
+           f"&DT1={date_str}&A=1&C=0&AT=MIL&FD=1")
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
     except PWTimeout:
         pass
-    await asyncio.sleep(4)
+    await asyncio.sleep(5)   # Auro web components need extra init time
 
     # Save a one-time snapshot of the raw form
     global _form_debug_saved
@@ -120,7 +140,6 @@ async def fill_and_search(page, origin, dest, year, month):
             pass
 
     # ── 1. Flexible dates ─────────────────────────────────────────────────────
-    # Try get_by_label first (most reliable), fall back to text click
     try:
         await page.get_by_label("Flexible dates").check(timeout=3000)
     except Exception:
@@ -140,103 +159,181 @@ async def fill_and_search(page, origin, dest, year, month):
             pass
     await asyncio.sleep(0.5)
 
-    # ── 3. Date — click the Date button, navigate picker to target month ──────
-    # The Date field is a custom web component, NOT a plain <button>.
+    # ── 3. Date — use JS to pierce shadow DOM and open/navigate the picker ────
     global _datepicker_debug_saved
     try:
-        # div[slot="trigger"] is the date picker trigger; inner span intercepts
-        # clicks so we must use force=True to bypass pointer-event blocking
-        date_trigger = page.locator("div[slot='trigger']").first
-        try:
-            await date_trigger.click(force=True, timeout=3000)
-        except Exception:
-            await date_trigger.dispatch_event("click")
-        await asyncio.sleep(1.5)
+        # Check if URL param DT1 already pre-populated the date field
+        date_pre_set = await page.evaluate(f"""
+            (() => {{
+                {_JS_FIND}
+                var trigger = findDeep(document, "div[slot='trigger']");
+                if (!trigger) return false;
+                var txt = (trigger.textContent || '').trim().toLowerCase();
+                return txt !== '' && txt !== 'date' && txt.length > 4;
+            }})()
+        """)
 
-        # Save one-time screenshot of the date picker
-        if not _datepicker_debug_saved:
-            _datepicker_debug_saved = True
-            try:
-                await page.screenshot(path="debug_datepicker.png", full_page=False)
-                print("    📄 Saved debug_datepicker.png")
-            except Exception:
-                pass
+        if not date_pre_set:
+            # Open date picker — JS click pierces shadow DOM pointer-event issues
+            await page.evaluate(f"""
+                (() => {{
+                    {_JS_FIND}
+                    var trigger = findDeep(document, "div[slot='trigger']") ||
+                                  findDeep(document, "auro-datepicker");
+                    if (trigger) trigger.click();
+                }})()
+            """)
+            await asyncio.sleep(2)
 
-        # Navigate forward until the target month is visible
-        target = search_date.strftime("%B %Y")   # e.g. "March 2026"
-        for _ in range(18):
-            # Check if the target month header is on screen
-            try:
-                header = await page.locator(
-                    "[class*='month' i]:not(button), [aria-live='polite'], "
-                    "[class*='header' i][class*='calendar' i]"
-                ).first.inner_text(timeout=1000)
-                if target.lower() in header.lower():
-                    break
-            except Exception:
-                pass
-            # Click the Next / forward arrow in the date picker
-            for next_sel in [
-                "button[aria-label*='Next month' i]",
-                "button[aria-label='Next']",
-                "button[title*='Next' i]",
-                "button[class*='next' i]",
-            ]:
+            # Save datepicker debug screenshot
+            if not _datepicker_debug_saved:
+                _datepicker_debug_saved = True
                 try:
-                    nxt = page.locator(next_sel).last
-                    if await nxt.is_visible(timeout=500):
-                        await nxt.click()
-                        await asyncio.sleep(0.4)
-                        break
+                    await page.screenshot(path="debug_datepicker.png", full_page=False)
+                    print("    📄 Saved debug_datepicker.png")
                 except Exception:
-                    continue
+                    pass
 
-        # Click day "1" (exact text match to avoid hitting "11", "21", "31")
-        day_cells = await page.locator(
-            "button[class*='day' i], td[class*='day' i], "
-            "[role='gridcell'], [class*='Day' i]:not([class*='disabled' i])"
-        ).all()
-        for cell in day_cells:
-            try:
-                if (await cell.inner_text()).strip() == "1":
-                    await cell.click()
+            # Navigate picker forward until target month is visible
+            target = search_date.strftime("%B %Y").lower()   # "march 2026"
+            for _ in range(18):
+                visible = await page.evaluate(f"""
+                    (() => {{
+                        var headers = document.querySelectorAll(
+                            '[aria-live], [class*="month"], [class*="calendar"]'
+                        );
+                        for (var i = 0; i < headers.length; i++) {{
+                            if ((headers[i].textContent || '').toLowerCase()
+                                    .indexOf('{target}') >= 0) return true;
+                        }}
+                        return false;
+                    }})()
+                """)
+                if visible:
                     break
-            except Exception:
-                continue
-        await asyncio.sleep(0.5)
-    except Exception as e:
-        print(f"(date picker: {e}) ", end="")
+                # Click Next-month arrow via JS
+                clicked = await page.evaluate("""
+                    (() => {
+                        var btns = document.querySelectorAll('button');
+                        for (var i = 0; i < btns.length; i++) {
+                            var lbl = (btns[i].getAttribute('aria-label') || '').toLowerCase();
+                            if (lbl.indexOf('next month') >= 0 || lbl === 'next') {
+                                btns[i].click(); return true;
+                            }
+                        }
+                        return false;
+                    })()
+                """)
+                if not clicked:
+                    # Playwright fallback
+                    for sel in ["button[aria-label*='Next month' i]",
+                                "button[aria-label='Next']"]:
+                        try:
+                            await page.locator(sel).last.click(timeout=500)
+                            break
+                        except Exception:
+                            continue
+                await asyncio.sleep(0.5)
 
-    # ── 4. Passengers: 0 → 1 adult ───────────────────────────────────────────
-    # "text=0 adults" matches both the div and the slot — use the div[slot] directly
+            # Click day "1" via JS (exact text match, skip disabled/outside days)
+            await page.evaluate("""
+                (() => {
+                    var candidates = document.querySelectorAll(
+                        'td, button, [role="gridcell"]'
+                    );
+                    for (var i = 0; i < candidates.length; i++) {
+                        var el = candidates[i];
+                        var txt = (el.textContent || '').trim();
+                        var cls = (el.className || '').toLowerCase();
+                        if (txt === '1' && !el.disabled &&
+                            cls.indexOf('disabled') < 0 &&
+                            cls.indexOf('other') < 0 &&
+                            cls.indexOf('outside') < 0) {
+                            el.click(); return;
+                        }
+                    }
+                })()
+            """)
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        print(f"(date: {e}) ", end="")
+
+    # ── 4. Passengers: ensure 1 adult ─────────────────────────────────────────
     try:
-        await page.locator("div[slot='valueText']:has-text('0 adults')").click(timeout=3000)
-        await asyncio.sleep(0.8)
-        # Increment adult count
-        for inc_sel in [
-            "button[aria-label*='Add adult' i]",
-            "button[aria-label*='increase' i]",
-            "button:has-text('+') >> nth=0",
-        ]:
+        # Check if URL param A=1 already pre-populated passengers
+        pax_pre_set = await page.evaluate(f"""
+            (() => {{
+                {_JS_FIND}
+                var el = findDeep(document, "div[slot='valueText']") ||
+                         findDeep(document, "[slot='valueText']");
+                if (!el) return false;
+                return (el.textContent || '').toLowerCase().indexOf('1 adult') >= 0;
+            }})()
+        """)
+
+        if not pax_pre_set:
+            # Open passenger dropdown via JS
+            await page.evaluate(f"""
+                (() => {{
+                    {_JS_FIND}
+                    var pax = findDeep(document, "div[slot='valueText']") ||
+                              findDeep(document, "[slot='valueText']") ||
+                              findDeep(document, "[class*='passenger']");
+                    if (pax) pax.click();
+                }})()
+            """)
+            await asyncio.sleep(1)
+
+            # Click the + (Add adult) button via JS
+            await page.evaluate("""
+                (() => {
+                    var btns = document.querySelectorAll('button');
+                    for (var i = 0; i < btns.length; i++) {
+                        var lbl = (btns[i].getAttribute('aria-label') || '').toLowerCase();
+                        if (lbl.indexOf('add adult') >= 0 ||
+                            lbl.indexOf('increase adult') >= 0 ||
+                            (lbl.indexOf('adult') >= 0 && lbl.indexOf('add') >= 0)) {
+                            btns[i].click(); return;
+                        }
+                    }
+                    // Fallback: first visible + button
+                    for (var i = 0; i < btns.length; i++) {
+                        if ((btns[i].textContent || '').trim() === '+' &&
+                            btns[i].offsetParent !== null) {
+                            btns[i].click(); return;
+                        }
+                    }
+                })()
+            """)
+            await asyncio.sleep(0.4)
+
+            # Close dropdown
             try:
-                inc = page.locator(inc_sel).first
-                if await inc.is_visible(timeout=1000):
-                    await inc.click()
-                    break
+                await page.locator("button:has-text('Done')").click(timeout=1500)
             except Exception:
-                continue
-        await asyncio.sleep(0.4)
-        try:
-            await page.locator("button:has-text('Done')").click(timeout=1500)
-        except Exception:
-            await page.keyboard.press("Escape")
+                await page.keyboard.press("Escape")
     except Exception as e:
-        print(f"(passengers: {e}) ", end="")
+        print(f"(pax: {e}) ", end="")
     await asyncio.sleep(0.5)
 
-    # ── 5. Submit ─────────────────────────────────────────────────────────────
-    # Alaska web components have inner spans that intercept clicks;
-    # force=True bypasses pointer-event blocking.
+    # ── 5. Submit — JS click first (most reliable), Playwright as fallback ─────
+    try:
+        submitted = await page.evaluate("""
+            (() => {
+                var btns = document.querySelectorAll('button, [role="button"]');
+                for (var i = 0; i < btns.length; i++) {
+                    if ((btns[i].textContent || '').indexOf('Search flights') >= 0) {
+                        btns[i].click(); return true;
+                    }
+                }
+                return false;
+            })()
+        """)
+        if submitted:
+            return True
+    except Exception:
+        pass
+
     for submit_sel in [
         "button:has-text('Search flights')",
         "[role='button']:has-text('Search flights')",
@@ -302,7 +399,36 @@ async def wait_for_results(page, label):
     """Wait for search results to appear (search form gone + results present)."""
     global _debug_saved
 
-    # Wait for search button to disappear (results loading)
+    # After submit, wait briefly then check if form validation blocked navigation.
+    # If the Search button is still visible AND validation errors exist, fail fast.
+    await asyncio.sleep(3)
+    try:
+        still_on_form = await page.locator(
+            "button:has-text('Search flights')"
+        ).is_visible(timeout=1000)
+        if still_on_form:
+            # Check for validation error text
+            err_text = await page.evaluate("""
+                (() => {
+                    var sels = ['[class*="error"]', '[class*="validation"]',
+                                '[aria-live="assertive"]', '[class*="alert"]'];
+                    for (var i = 0; i < sels.length; i++) {
+                        var els = document.querySelectorAll(sels[i]);
+                        for (var j = 0; j < els.length; j++) {
+                            var t = (els[j].textContent || '').trim();
+                            if (t.length > 10) return t.substring(0, 120);
+                        }
+                    }
+                    return '';
+                })()
+            """)
+            if err_text:
+                print(f"    ✗ Validation error: {err_text[:80]}")
+                return False
+    except Exception:
+        pass
+
+    # Wait for search button to disappear (navigation / results loading)
     try:
         await page.wait_for_selector(
             "button:has-text('Search flights')", state="hidden", timeout=25000
