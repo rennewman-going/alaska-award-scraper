@@ -106,7 +106,10 @@ CELL_SELS = [
     "td:not([class*='disabled']):not([class*='empty'])",
 ]
 
+_debug_saved = False  # only dump once
+
 async def wait_for_page(page, label):
+    global _debug_saved
     for sel in LOAD_SELS:
         try:
             await page.wait_for_selector(sel, timeout=18000)
@@ -114,6 +117,16 @@ async def wait_for_page(page, label):
         except PWTimeout:
             continue
     print(f"    ⚠ Nothing rendered: {label}")
+    if not _debug_saved:
+        _debug_saved = True
+        try:
+            html = await page.content()
+            with open("debug.html", "w", encoding="utf-8") as f:
+                f.write(html)
+            await page.screenshot(path="debug.png", full_page=True)
+            print("    📄 Saved debug.html and debug.png — share these to fix selectors")
+        except Exception as e:
+            print(f"    (debug save failed: {e})")
     return False
 
 async def get_cells(page):
