@@ -1,0 +1,26 @@
+# CSV outputs
+output/
+*.csv
+
+# Playwright browser cache and artifacts
+.playwright/
+playwright-report/
+test-results/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
