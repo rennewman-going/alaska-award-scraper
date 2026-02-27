@@ -103,7 +103,19 @@ async def fill_and_search(page, origin, dest, year, month):
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
     except PWTimeout:
         pass
-    await asyncio.sleep(3)
+    await asyncio.sleep(4)
+
+    # Save a one-time snapshot of the raw form so selectors can be diagnosed
+    global _form_debug_saved
+    if not _form_debug_saved:
+        _form_debug_saved = True
+        try:
+            await page.screenshot(path="debug_form.png", full_page=False)
+            with open("debug_form.html", "w", encoding="utf-8") as f:
+                f.write(await page.content())
+            print("    📄 Saved debug_form.png/.html")
+        except Exception:
+            pass
 
     # ── Use points ────────────────────────────────────────────────────────────
     for sel in [
@@ -277,6 +289,7 @@ CELL_SELS = [
 ]
 
 _debug_saved = False
+_form_debug_saved = False
 
 async def wait_for_results(page, label):
     """Wait for search results to appear (search form gone + results present)."""
