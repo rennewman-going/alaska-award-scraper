@@ -2,6 +2,9 @@
 output/
 *.csv
 
+# Runtime logs
+*.log
+
 # Playwright browser cache and artifacts
 .playwright/
 playwright-report/
