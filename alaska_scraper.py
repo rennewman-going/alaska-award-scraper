@@ -163,61 +163,73 @@ async def fill_and_search(page, origin, dest, year, month):
     await asyncio.sleep(0.5)
 
     # ── 3. Date ───────────────────────────────────────────────────────────────
-    # Check if the date field already contains a year (e.g. "2026" or "2027"),
-    # meaning URL params pre-populated it. Otherwise open the picker.
+    # div[slot='trigger'] lives inside a shadow DOM — Playwright pierces it,
+    # but document.querySelector cannot. Use Playwright for all date work.
     global _datepicker_debug_saved
     try:
-        trigger_text = await page.evaluate("""
-            (() => {
-                var t = document.querySelector("div[slot='trigger']");
-                return t ? t.textContent.trim() : '';
-            })()
-        """)
-        date_pre_set = bool(re.search(r"20(26|27)", trigger_text))
-        print(f"    📅 trigger_text='{trigger_text[:40]}' pre_set={date_pre_set}")
+        trigger_loc = page.locator("div[slot='trigger']").first
+
+        # Check if trigger already shows a date (year 2026/2027 = pre-set)
+        try:
+            trigger_text_pw = await trigger_loc.inner_text(timeout=3000)
+        except Exception:
+            trigger_text_pw = ""
+        date_pre_set = bool(re.search(r"20(26|27)", trigger_text_pw))
+        print(f"    📅 trigger='{trigger_text_pw[:40]}' pre_set={date_pre_set}")
 
         if not date_pre_set:
-            # Try 1: set value directly on auro-datepicker component
-            fmt = f"{month:02d}/01/{year}"   # MM/DD/YYYY — Auro's typical format
-            set_ok = await page.evaluate(f"""
-                (() => {{
-                    var dp = document.querySelector('auro-datepicker');
-                    if (!dp) return false;
-                    dp.value = '{fmt}';
-                    dp.setAttribute('value', '{fmt}');
-                    dp.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    dp.dispatchEvent(new CustomEvent('auroDatePicker-valueSet',
-                        {{bubbles: true, detail: {{value: '{fmt}'}}}}));
-                    return true;
-                }})()
-            """)
-            await asyncio.sleep(1)
-            trigger_text2 = await page.evaluate("""
-                (() => {
-                    var t = document.querySelector("div[slot='trigger']");
-                    return t ? t.textContent.trim() : '';
-                })()
-            """)
-            date_pre_set = bool(re.search(r"20(26|27)", trigger_text2))
-            print(f"    📅 after direct-set: '{trigger_text2[:40]}' ok={date_pre_set}")
+            # Print parent element info so we know the component name
+            try:
+                parent_info = await trigger_loc.evaluate(
+                    "el => el.parentElement ? el.parentElement.tagName + ' cls=' + el.parentElement.className : 'none'"
+                )
+                print(f"    📅 parent: {parent_info[:80]}")
+            except Exception as e:
+                print(f"    📅 parent info failed: {e}")
 
-        if not date_pre_set:
-            # Try 2: open the date picker by clicking the trigger
-            # Use Playwright locator (which pierces shadow DOM) with force=True
-            for click_sel in [
-                "auro-datepicker",
-                "div[slot='trigger']",
-                "text=Date",
-            ]:
-                try:
-                    await page.locator(click_sel).first.click(force=True, timeout=2000)
-                    await asyncio.sleep(0.5)
-                    break
-                except Exception:
-                    continue
-            await asyncio.sleep(2)
+            # Try multiple strategies to open the date picker
+            opened = False
+            # Strategy 1: click the parent element (the component host)
+            try:
+                result = await trigger_loc.evaluate("""
+                    el => {
+                        var p = el.parentElement;
+                        if (p) { p.click(); return 'parent:' + p.tagName; }
+                        return 'no-parent';
+                    }
+                """)
+                print(f"    📅 parent click: {result}")
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                print(f"    📅 parent click failed: {e}")
 
-            # Always save datepicker debug screenshot (regardless of whether picker opened)
+            # Strategy 2: dispatch mousedown+mouseup on the trigger itself
+            try:
+                await trigger_loc.dispatch_event("mousedown")
+                await asyncio.sleep(0.1)
+                await trigger_loc.dispatch_event("mouseup")
+                await trigger_loc.dispatch_event("click")
+                await asyncio.sleep(1.5)
+            except Exception:
+                pass
+
+            # Strategy 3: Playwright force-click on the trigger
+            try:
+                await trigger_loc.click(force=True, timeout=2000)
+                await asyncio.sleep(1.5)
+            except Exception:
+                pass
+
+            # Strategy 4: Tab to the date field and press Enter/Space
+            try:
+                await page.keyboard.press("Tab")
+                await asyncio.sleep(0.3)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(1.5)
+            except Exception:
+                pass
+
+            # Always save datepicker debug screenshot
             if not _datepicker_debug_saved:
                 _datepicker_debug_saved = True
                 try:
@@ -226,28 +238,36 @@ async def fill_and_search(page, origin, dest, year, month):
                 except Exception:
                     pass
 
+            # Check if picker is now open
+            try:
+                picker_open = await page.locator(
+                    "[class*='calendar'], [class*='Calendar'], "
+                    "[role='dialog'], [class*='datepicker'], [class*='DatePicker']"
+                ).count()
+                print(f"    📅 picker_open elements: {picker_open}")
+            except Exception:
+                pass
+
             # Navigate to target month
             target = search_date.strftime("%B %Y").lower()
             for _ in range(18):
                 try:
-                    header_text = await page.evaluate("""
-                        (() => {
-                            var els = document.querySelectorAll(
-                                '[aria-live], [class*="month"], h2, h3'
-                            );
-                            var texts = [];
-                            for (var i = 0; i < els.length; i++) {
-                                var t = (els[i].textContent || '').trim();
-                                if (t.length > 3 && t.length < 30) texts.push(t.toLowerCase());
-                            }
-                            return texts.join('|');
-                        })()
-                    """)
-                    if target in header_text:
+                    # Use Playwright to get all potential month header texts
+                    header_els = await page.locator(
+                        "[aria-live], [class*='month' i]:not(button), h2, h3"
+                    ).all()
+                    for h in header_els:
+                        try:
+                            ht = (await h.inner_text(timeout=300)).lower()
+                            if target in ht:
+                                target = None  # signal: found
+                                break
+                        except Exception:
+                            continue
+                    if target is None:
                         break
                 except Exception:
                     pass
-                # Click Next month
                 for sel in ["button[aria-label*='Next month' i]",
                             "button[aria-label='Next']",
                             "button[class*='next' i]"]:
@@ -264,8 +284,7 @@ async def fill_and_search(page, origin, dest, year, month):
             ).all()
             for cell in day_cells:
                 try:
-                    txt = (await cell.inner_text()).strip()
-                    if txt == "1":
+                    if (await cell.inner_text(timeout=300)).strip() == "1":
                         await cell.click()
                         break
                 except Exception:
