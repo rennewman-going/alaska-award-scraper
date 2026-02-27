@@ -92,22 +92,6 @@ SEARCH_BASE = "https://www.alaskaair.com/search/results"
 
 _datepicker_debug_saved = False
 
-# ── JavaScript helpers that pierce shadow DOM ──────────────────────────────────
-_JS_FIND = """
-function findDeep(root, selector) {
-    var el = root.querySelector(selector);
-    if (el) return el;
-    var all = root.querySelectorAll('*');
-    for (var i = 0; i < all.length; i++) {
-        if (all[i].shadowRoot) {
-            el = findDeep(all[i].shadowRoot, selector);
-            if (el) return el;
-        }
-    }
-    return null;
-}
-"""
-
 async def fill_and_search(page, origin, dest, year, month):
     """
     Navigate to the search form, fill it (Flexible dates + Use points +
@@ -116,8 +100,7 @@ async def fill_and_search(page, origin, dest, year, month):
     """
     search_date = date(year, month, 1)
     date_str = f"{year}{month:02d}01"
-    # Include all known params — DT1/A/AT/FD may pre-populate date, passengers,
-    # award mode, and flexible dates, reducing how much UI interaction is needed.
+    # Include all known params — A=1 pre-populates passengers; others may help.
     url = (f"{SEARCH_BASE}?O={origin}&D={dest}&RT=false"
            f"&DT1={date_str}&A=1&C=0&AT=MIL&FD=1")
 
@@ -139,6 +122,26 @@ async def fill_and_search(page, origin, dest, year, month):
         except Exception:
             pass
 
+    # ── Diagnostic: print what elements are present ───────────────────────────
+    try:
+        info = await page.evaluate("""
+            (() => {
+                var dp = document.querySelector('auro-datepicker');
+                var trigger = document.querySelector("div[slot='trigger']");
+                var pax = document.querySelector("div[slot='valueText']");
+                return JSON.stringify({
+                    has_datepicker: !!dp,
+                    has_trigger: !!trigger,
+                    trigger_text: trigger ? trigger.textContent.trim().substring(0, 30) : 'none',
+                    has_pax: !!pax,
+                    pax_text: pax ? pax.textContent.trim().substring(0, 20) : 'none'
+                });
+            })()
+        """)
+        print(f"    🔍 {info}")
+    except Exception as e:
+        print(f"    🔍 (diagnostic failed: {e})")
+
     # ── 1. Flexible dates ─────────────────────────────────────────────────────
     try:
         await page.get_by_label("Flexible dates").check(timeout=3000)
@@ -159,33 +162,62 @@ async def fill_and_search(page, origin, dest, year, month):
             pass
     await asyncio.sleep(0.5)
 
-    # ── 3. Date — use JS to pierce shadow DOM and open/navigate the picker ────
+    # ── 3. Date ───────────────────────────────────────────────────────────────
+    # Check if the date field already contains a year (e.g. "2026" or "2027"),
+    # meaning URL params pre-populated it. Otherwise open the picker.
     global _datepicker_debug_saved
     try:
-        # Check if URL param DT1 already pre-populated the date field
-        date_pre_set = await page.evaluate(f"""
-            (() => {{
-                {_JS_FIND}
-                var trigger = findDeep(document, "div[slot='trigger']");
-                if (!trigger) return false;
-                var txt = (trigger.textContent || '').trim().toLowerCase();
-                return txt !== '' && txt !== 'date' && txt.length > 4;
-            }})()
+        trigger_text = await page.evaluate("""
+            (() => {
+                var t = document.querySelector("div[slot='trigger']");
+                return t ? t.textContent.trim() : '';
+            })()
         """)
+        date_pre_set = bool(re.search(r"20(26|27)", trigger_text))
+        print(f"    📅 trigger_text='{trigger_text[:40]}' pre_set={date_pre_set}")
 
         if not date_pre_set:
-            # Open date picker — JS click pierces shadow DOM pointer-event issues
-            await page.evaluate(f"""
+            # Try 1: set value directly on auro-datepicker component
+            fmt = f"{month:02d}/01/{year}"   # MM/DD/YYYY — Auro's typical format
+            set_ok = await page.evaluate(f"""
                 (() => {{
-                    {_JS_FIND}
-                    var trigger = findDeep(document, "div[slot='trigger']") ||
-                                  findDeep(document, "auro-datepicker");
-                    if (trigger) trigger.click();
+                    var dp = document.querySelector('auro-datepicker');
+                    if (!dp) return false;
+                    dp.value = '{fmt}';
+                    dp.setAttribute('value', '{fmt}');
+                    dp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    dp.dispatchEvent(new CustomEvent('auroDatePicker-valueSet',
+                        {{bubbles: true, detail: {{value: '{fmt}'}}}}));
+                    return true;
                 }})()
             """)
+            await asyncio.sleep(1)
+            trigger_text2 = await page.evaluate("""
+                (() => {
+                    var t = document.querySelector("div[slot='trigger']");
+                    return t ? t.textContent.trim() : '';
+                })()
+            """)
+            date_pre_set = bool(re.search(r"20(26|27)", trigger_text2))
+            print(f"    📅 after direct-set: '{trigger_text2[:40]}' ok={date_pre_set}")
+
+        if not date_pre_set:
+            # Try 2: open the date picker by clicking the trigger
+            # Use Playwright locator (which pierces shadow DOM) with force=True
+            for click_sel in [
+                "auro-datepicker",
+                "div[slot='trigger']",
+                "text=Date",
+            ]:
+                try:
+                    await page.locator(click_sel).first.click(force=True, timeout=2000)
+                    await asyncio.sleep(0.5)
+                    break
+                except Exception:
+                    continue
             await asyncio.sleep(2)
 
-            # Save datepicker debug screenshot
+            # Always save datepicker debug screenshot (regardless of whether picker opened)
             if not _datepicker_debug_saved:
                 _datepicker_debug_saved = True
                 try:
@@ -194,146 +226,92 @@ async def fill_and_search(page, origin, dest, year, month):
                 except Exception:
                     pass
 
-            # Navigate picker forward until target month is visible
-            target = search_date.strftime("%B %Y").lower()   # "march 2026"
+            # Navigate to target month
+            target = search_date.strftime("%B %Y").lower()
             for _ in range(18):
-                visible = await page.evaluate(f"""
-                    (() => {{
-                        var headers = document.querySelectorAll(
-                            '[aria-live], [class*="month"], [class*="calendar"]'
-                        );
-                        for (var i = 0; i < headers.length; i++) {{
-                            if ((headers[i].textContent || '').toLowerCase()
-                                    .indexOf('{target}') >= 0) return true;
-                        }}
-                        return false;
-                    }})()
-                """)
-                if visible:
-                    break
-                # Click Next-month arrow via JS
-                clicked = await page.evaluate("""
-                    (() => {
-                        var btns = document.querySelectorAll('button');
-                        for (var i = 0; i < btns.length; i++) {
-                            var lbl = (btns[i].getAttribute('aria-label') || '').toLowerCase();
-                            if (lbl.indexOf('next month') >= 0 || lbl === 'next') {
-                                btns[i].click(); return true;
+                try:
+                    header_text = await page.evaluate("""
+                        (() => {
+                            var els = document.querySelectorAll(
+                                '[aria-live], [class*="month"], h2, h3'
+                            );
+                            var texts = [];
+                            for (var i = 0; i < els.length; i++) {
+                                var t = (els[i].textContent || '').trim();
+                                if (t.length > 3 && t.length < 30) texts.push(t.toLowerCase());
                             }
-                        }
-                        return false;
-                    })()
-                """)
-                if not clicked:
-                    # Playwright fallback
-                    for sel in ["button[aria-label*='Next month' i]",
-                                "button[aria-label='Next']"]:
-                        try:
-                            await page.locator(sel).last.click(timeout=500)
-                            break
-                        except Exception:
-                            continue
-                await asyncio.sleep(0.5)
+                            return texts.join('|');
+                        })()
+                    """)
+                    if target in header_text:
+                        break
+                except Exception:
+                    pass
+                # Click Next month
+                for sel in ["button[aria-label*='Next month' i]",
+                            "button[aria-label='Next']",
+                            "button[class*='next' i]"]:
+                    try:
+                        await page.locator(sel).last.click(timeout=800)
+                        await asyncio.sleep(0.5)
+                        break
+                    except Exception:
+                        continue
 
-            # Click day "1" via JS (exact text match, skip disabled/outside days)
-            await page.evaluate("""
-                (() => {
-                    var candidates = document.querySelectorAll(
-                        'td, button, [role="gridcell"]'
-                    );
-                    for (var i = 0; i < candidates.length; i++) {
-                        var el = candidates[i];
-                        var txt = (el.textContent || '').trim();
-                        var cls = (el.className || '').toLowerCase();
-                        if (txt === '1' && !el.disabled &&
-                            cls.indexOf('disabled') < 0 &&
-                            cls.indexOf('other') < 0 &&
-                            cls.indexOf('outside') < 0) {
-                            el.click(); return;
-                        }
-                    }
-                })()
-            """)
+            # Click day "1"
+            day_cells = await page.locator(
+                "button[class*='day' i], td[class*='day' i], [role='gridcell']"
+            ).all()
+            for cell in day_cells:
+                try:
+                    txt = (await cell.inner_text()).strip()
+                    if txt == "1":
+                        await cell.click()
+                        break
+                except Exception:
+                    continue
             await asyncio.sleep(0.5)
+
     except Exception as e:
-        print(f"(date: {e}) ", end="")
+        print(f"    (date step error: {e})")
 
-    # ── 4. Passengers: ensure 1 adult ─────────────────────────────────────────
+    # ── 4. Passengers: ensure 1 adult (usually set by A=1 URL param) ─────────
     try:
-        # Check if URL param A=1 already pre-populated passengers
-        pax_pre_set = await page.evaluate(f"""
-            (() => {{
-                {_JS_FIND}
-                var el = findDeep(document, "div[slot='valueText']") ||
-                         findDeep(document, "[slot='valueText']");
-                if (!el) return false;
-                return (el.textContent || '').toLowerCase().indexOf('1 adult') >= 0;
-            }})()
+        pax_text = await page.evaluate("""
+            (() => {
+                var el = document.querySelector("div[slot='valueText']") ||
+                         document.querySelector("[slot='valueText']");
+                return el ? el.textContent.trim() : '';
+            })()
         """)
-
-        if not pax_pre_set:
-            # Open passenger dropdown via JS
-            await page.evaluate(f"""
-                (() => {{
-                    {_JS_FIND}
-                    var pax = findDeep(document, "div[slot='valueText']") ||
-                              findDeep(document, "[slot='valueText']") ||
-                              findDeep(document, "[class*='passenger']");
-                    if (pax) pax.click();
-                }})()
-            """)
+        print(f"    👥 pax_text='{pax_text}'")
+        if "1 adult" not in pax_text.lower():
+            # Open dropdown and add 1 adult
+            await page.locator("div[slot='valueText']").first.click(
+                force=True, timeout=2000
+            )
             await asyncio.sleep(1)
-
-            # Click the + (Add adult) button via JS
-            await page.evaluate("""
-                (() => {
-                    var btns = document.querySelectorAll('button');
-                    for (var i = 0; i < btns.length; i++) {
-                        var lbl = (btns[i].getAttribute('aria-label') || '').toLowerCase();
-                        if (lbl.indexOf('add adult') >= 0 ||
-                            lbl.indexOf('increase adult') >= 0 ||
-                            (lbl.indexOf('adult') >= 0 && lbl.indexOf('add') >= 0)) {
-                            btns[i].click(); return;
-                        }
-                    }
-                    // Fallback: first visible + button
-                    for (var i = 0; i < btns.length; i++) {
-                        if ((btns[i].textContent || '').trim() === '+' &&
-                            btns[i].offsetParent !== null) {
-                            btns[i].click(); return;
-                        }
-                    }
-                })()
-            """)
+            for inc_sel in [
+                "button[aria-label*='Add adult' i]",
+                "button[aria-label*='increase' i]",
+            ]:
+                try:
+                    inc = page.locator(inc_sel).first
+                    if await inc.is_visible(timeout=1000):
+                        await inc.click()
+                        break
+                except Exception:
+                    continue
             await asyncio.sleep(0.4)
-
-            # Close dropdown
             try:
                 await page.locator("button:has-text('Done')").click(timeout=1500)
             except Exception:
                 await page.keyboard.press("Escape")
     except Exception as e:
-        print(f"(pax: {e}) ", end="")
+        print(f"    (pax step error: {e})")
     await asyncio.sleep(0.5)
 
-    # ── 5. Submit — JS click first (most reliable), Playwright as fallback ─────
-    try:
-        submitted = await page.evaluate("""
-            (() => {
-                var btns = document.querySelectorAll('button, [role="button"]');
-                for (var i = 0; i < btns.length; i++) {
-                    if ((btns[i].textContent || '').indexOf('Search flights') >= 0) {
-                        btns[i].click(); return true;
-                    }
-                }
-                return false;
-            })()
-        """)
-        if submitted:
-            return True
-    except Exception:
-        pass
-
+    # ── 5. Submit ─────────────────────────────────────────────────────────────
     for submit_sel in [
         "button:has-text('Search flights')",
         "[role='button']:has-text('Search flights')",
