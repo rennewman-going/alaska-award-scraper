@@ -163,13 +163,19 @@ async def fill_and_search(page, origin, dest, year, month):
     await asyncio.sleep(0.5)
 
     # ── 3. Date ───────────────────────────────────────────────────────────────
-    # div[slot='trigger'] lives inside a shadow DOM — Playwright pierces it,
-    # but document.querySelector cannot. Use Playwright for all date work.
+    # div[slot='trigger'] elements on page (in order):
+    #   [0] Language/Currency select
+    #   [1] Origin combobox
+    #   [2] Destination combobox
+    #   [3] AURO-FORMKIT-DATEPICKER-DROPDOWN  ← this one
+    #   [4] Passengers counter
+    #   [5] Cabin-class select
     global _datepicker_debug_saved
     try:
-        trigger_loc = page.locator("div[slot='trigger']").first
+        DATE_TRIGGER_IDX = 3
+        trigger_loc = page.locator("[slot='trigger']").nth(DATE_TRIGGER_IDX)
 
-        # Check if trigger already shows a date (year 2026/2027 = pre-set)
+        # Check if trigger already shows a year → pre-set by URL param
         try:
             trigger_text_pw = await trigger_loc.inner_text(timeout=3000)
         except Exception:
@@ -178,46 +184,83 @@ async def fill_and_search(page, origin, dest, year, month):
         print(f"    📅 trigger='{trigger_text_pw[:40]}' pre_set={date_pre_set}")
 
         if not date_pre_set:
-            # ── Enumerate ALL [slot='trigger'] elements to identify the date one ──
-            # There are multiple on the page (date, passengers, etc.) — .first may
-            # be wrong. Print each one's parent tag and text content.
-            try:
-                all_triggers = await page.locator("[slot='trigger']").all()
-                print(f"    📅 total [slot='trigger']: {len(all_triggers)}")
-                for i, t in enumerate(all_triggers[:6]):
-                    try:
-                        info = await t.evaluate(
-                            "el => (el.parentElement ? el.parentElement.tagName : 'none')"
-                            " + ' | ' + el.textContent.trim().slice(0,25)"
-                        )
-                        print(f"    📅   [{i}] {info}")
-                    except Exception:
-                        pass
-            except Exception as e:
-                print(f"    📅 trigger enum failed: {e}")
+            # Click the datepicker trigger to open the calendar panel
+            await trigger_loc.click(timeout=5000)
+            await asyncio.sleep(1.5)
 
-            # ── Probe for date-specific Auro elements ──
-            for probe_sel in ["auro-datepicker",
-                              "[aria-label*='depart' i]",
-                              "[aria-label*='date' i]",
-                              "input[type='date']"]:
-                try:
-                    n = await page.locator(probe_sel).count()
-                    if n:
-                        print(f"    📅 probe '{probe_sel}': {n}")
-                except Exception:
-                    pass
-
-            # ── Save debug screenshot + HTML (once) without clicking anything ──
+            # Debug screenshot after opening (once)
             if not _datepicker_debug_saved:
                 _datepicker_debug_saved = True
                 try:
                     await page.screenshot(path="debug_datepicker.png", full_page=False)
                     with open("debug_datepicker.html", "w") as fh:
                         fh.write(await page.content())
-                    print("    📄 Saved debug_datepicker.png/.html")
+                    print("    📄 Saved debug_datepicker.png/.html (after open)")
                 except Exception:
                     pass
+
+            # Confirm calendar cells are visible
+            day_sel = "auro-calendar-cell"
+            for d_sel in ["auro-calendar-cell", "[role='gridcell']",
+                          "button[class*='day' i]", "td[class*='day' i]"]:
+                try:
+                    n = await page.locator(d_sel).count()
+                    if n > 0:
+                        day_sel = d_sel
+                        print(f"    📅 day cells '{d_sel}': {n}")
+                        break
+                except Exception:
+                    continue
+            else:
+                print("    📅 WARNING: no day cells found after click")
+
+            # Navigate to target month
+            target_str = search_date.strftime("%B %Y").lower()
+            for _ in range(18):
+                found_month = False
+                for h_sel in ["[aria-live]", "[class*='month' i]", "h2", "h3"]:
+                    try:
+                        for h in await page.locator(h_sel).all():
+                            ht = (await h.inner_text(timeout=300)).lower()
+                            if target_str in ht:
+                                found_month = True
+                                break
+                    except Exception:
+                        pass
+                    if found_month:
+                        break
+                if found_month:
+                    print(f"    📅 found month: {target_str}")
+                    break
+                for nxt in ["button[aria-label*='next month' i]",
+                            "button[aria-label='Next']",
+                            "button[class*='next' i]"]:
+                    try:
+                        await page.locator(nxt).last.click(timeout=800)
+                        await asyncio.sleep(0.5)
+                        break
+                    except Exception:
+                        continue
+
+            # Click the target day
+            day_num = str(search_date.day)
+            day_clicked = False
+            for sel in [day_sel, "auro-calendar-cell", "[role='gridcell']"]:
+                for cell in await page.locator(sel).all():
+                    try:
+                        txt = (await cell.inner_text(timeout=300)).strip()
+                        if txt == day_num:
+                            await cell.click()
+                            day_clicked = True
+                            print(f"    📅 clicked day {day_num} via '{sel}'")
+                            break
+                    except Exception:
+                        continue
+                if day_clicked:
+                    break
+            if not day_clicked:
+                print(f"    📅 WARNING: day {day_num} not clicked")
+            await asyncio.sleep(0.5)
 
     except Exception as e:
         print(f"    (date step error: {e})")
