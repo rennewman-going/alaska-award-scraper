@@ -180,12 +180,15 @@ async def fill_and_search(page, origin, dest, year, month):
             trigger_text_pw = await trigger_loc.inner_text(timeout=3000)
         except Exception:
             trigger_text_pw = ""
+        # "Invalid Date" means URL param was parsed badly — treat as not set
         date_pre_set = bool(re.search(r"20(26|27)", trigger_text_pw))
         print(f"    📅 trigger='{trigger_text_pw[:40]}' pre_set={date_pre_set}")
 
         if not date_pre_set:
-            # Click the datepicker trigger to open the calendar panel
-            await trigger_loc.click(timeout=5000)
+            # A <span slot="label"> overlaps the trigger div and intercepts normal
+            # clicks.  force=True bypasses Playwright's pointer-event check and
+            # delivers the click directly to the element.
+            await trigger_loc.click(timeout=5000, force=True)
             await asyncio.sleep(1.5)
 
             # Debug screenshot after opening (once)
