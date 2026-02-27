@@ -50,17 +50,10 @@ MONTH_LABELS = {
     (2027, 1):  "Jan 2027",
 }
 
-# ── URL / parse helpers ────────────────────────────────────────────────────────
-def award_url(origin, dest, year, month):
-    dt = date(year, month, 1).strftime("%Y-%m-%d")
-    return (
-        f"https://www.alaskaair.com/search/results"
-        f"?O={origin}&D={dest}&DT1={dt}&AT=MIL&RT=false&YT=1&SD=CALENDAR"
-    )
-
+# ── Parse / compress helpers ───────────────────────────────────────────────────
 def parse_cell(text: str):
     """
-    Parse a cell like "1\n4.5k +$19" or "9\n20k +$6".
+    Parse a calendar cell like "1\n4.5k +$19" or "9\n20k +$6".
     Returns (day: int, points: int, tax: str|None) or None.
     """
     text = text.strip()
@@ -94,37 +87,238 @@ def compress_days(days: list) -> str:
 def fmt_points(pts: int) -> str:
     return f"{pts // 1000}k" if pts % 1000 == 0 else f"{pts / 1000:.1f}k"
 
-# ── Page loading ───────────────────────────────────────────────────────────────
+# ── Form interaction ───────────────────────────────────────────────────────────
+SEARCH_BASE = "https://www.alaskaair.com/search/results"
+
+async def fill_and_search(page, origin, dest, year, month):
+    """
+    Navigate to the search form, fill it (Use points + Flexible dates +
+    1 passenger + departure month), and click Search flights.
+    Returns True if the form was submitted.
+    """
+    search_date = date(year, month, 1)
+    url = f"{SEARCH_BASE}?O={origin}&D={dest}&RT=false"
+
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    except PWTimeout:
+        pass
+    await asyncio.sleep(3)
+
+    # ── Use points ────────────────────────────────────────────────────────────
+    for sel in [
+        "label:has-text('Use points')",
+        "text=Use points",
+        "[for*='point' i]",
+        "input[id*='point' i]",
+    ]:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=2000):
+                await el.click()
+                await asyncio.sleep(0.4)
+                break
+        except Exception:
+            continue
+
+    # ── Flexible dates ────────────────────────────────────────────────────────
+    for sel in [
+        "label:has-text('Flexible dates')",
+        "text=Flexible dates",
+        "[for*='flexible' i]",
+        "input[id*='flexible' i]",
+    ]:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible(timeout=2000):
+                await el.click()
+                await asyncio.sleep(0.4)
+                break
+        except Exception:
+            continue
+
+    # ── Date: type the first day of the target month ──────────────────────────
+    # Try MM/DD/YYYY and YYYY-MM-DD; Alaska's input may accept either
+    for date_str in [
+        search_date.strftime("%-m/%-d/%Y"),   # 3/1/2026
+        search_date.strftime("%m/%d/%Y"),      # 03/01/2026
+        search_date.strftime("%Y-%m-%d"),      # 2026-03-01
+    ]:
+        for sel in [
+            "input[placeholder='Date']",
+            "input[placeholder*='ate' i]",
+            "input[aria-label*='eparture']",
+            "input[type='date']",
+            "[class*='date' i] input",
+        ]:
+            try:
+                inp = page.locator(sel).first
+                if await inp.is_visible(timeout=1000):
+                    await inp.click()
+                    await asyncio.sleep(0.2)
+                    await inp.press("Control+a")
+                    await inp.type(date_str, delay=40)
+                    await asyncio.sleep(0.2)
+                    val = await inp.input_value()
+                    if val:
+                        await page.keyboard.press("Escape")
+                        break
+            except Exception:
+                continue
+        else:
+            continue
+        break
+    await asyncio.sleep(0.3)
+
+    # ── Passengers: 0 → 1 adult ───────────────────────────────────────────────
+    for pax_sel in [
+        "button:has-text('0 adults')",
+        "button:has-text('Travelers')",
+        "button:has-text('Passengers')",
+        "[aria-label*='assenger' i]",
+        "[class*='passenger' i] button",
+    ]:
+        try:
+            btn = page.locator(pax_sel).first
+            if await btn.is_visible(timeout=1500):
+                await btn.click()
+                await asyncio.sleep(0.5)
+                # Increment adult count by 1
+                for inc_sel in [
+                    "button[aria-label*='dd adult' i]",
+                    "button[aria-label*='ncrease adult' i]",
+                    "[class*='adult' i] button:has-text('+')",
+                    "button[class*='increment']",
+                    "button:has-text('+') >> nth=0",
+                ]:
+                    try:
+                        inc = page.locator(inc_sel).first
+                        if await inc.is_visible(timeout=1000):
+                            await inc.click()
+                            break
+                    except Exception:
+                        continue
+                await asyncio.sleep(0.3)
+                # Close passenger dropdown
+                for close_sel in [
+                    "button:has-text('Done')",
+                    "button:has-text('Apply')",
+                    "button:has-text('Close')",
+                ]:
+                    try:
+                        c = page.locator(close_sel).first
+                        if await c.is_visible(timeout=1000):
+                            await c.click()
+                            break
+                    except Exception:
+                        continue
+                else:
+                    await page.keyboard.press("Escape")
+                break
+        except Exception:
+            continue
+    await asyncio.sleep(0.3)
+
+    # ── Submit ────────────────────────────────────────────────────────────────
+    for submit_sel in [
+        "button:has-text('Search flights')",
+        "button[type='submit']",
+        "button:has-text('Search')",
+    ]:
+        try:
+            btn = page.locator(submit_sel).first
+            if await btn.is_visible(timeout=1500):
+                await btn.click()
+                return True
+        except Exception:
+            continue
+
+    print("    ✗ Could not submit form", end=" ")
+    return False
+
+# ── Calendar navigation ────────────────────────────────────────────────────────
+async def click_next_month(page):
+    """Click the calendar's Next Month button. Returns True if clicked."""
+    for sel in [
+        "button[aria-label*='Next month' i]",
+        "button[aria-label='Next']",
+        "button[title*='Next month' i]",
+        "button[class*='next-month']",
+        "button[class*='nextMonth']",
+        "button[class*='arrow-right']",
+        "button[class*='arrowRight']",
+        "[class*='next-month'] button",
+        "[class*='nextMonth'] button",
+        # last chevron/arrow button on page as fallback
+        "button:has(svg) >> nth=-1",
+    ]:
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=1000):
+                await btn.click()
+                return True
+        except Exception:
+            continue
+    return False
+
+# ── Results detection ──────────────────────────────────────────────────────────
 LOAD_SELS = [
     "[class*='calendar']", "[class*='Calendar']",
     "[class*='flight-result']", "[class*='flightResult']",
+    "[class*='availability']", "[class*='Availability']",
+    "[role='grid']", "table",
 ]
 CELL_SELS = [
     "[class*='calendar-day']:not([class*='disabled']):not([class*='empty'])",
     "[class*='CalendarDay']:not([class*='disabled']):not([class*='outside'])",
     "[class*='day-cell']:not([class*='disabled']):not([class*='empty'])",
-    "td:not([class*='disabled']):not([class*='empty'])",
+    "[role='gridcell']:not([class*='disabled']):not([class*='empty'])",
+    "td:not([class*='disabled']):not([class*='empty']):not([class*='outside'])",
 ]
 
-_debug_saved = False  # only dump once
+_debug_saved = False
 
-async def wait_for_page(page, label):
+async def wait_for_results(page, label):
+    """Wait for search results to appear (search form gone + results present)."""
     global _debug_saved
+
+    # Wait for search button to disappear (results loading)
+    try:
+        await page.wait_for_selector(
+            "button:has-text('Search flights')", state="hidden", timeout=25000
+        )
+    except PWTimeout:
+        pass
+    await asyncio.sleep(2)
+
+    # Wait for any results indicator
     for sel in LOAD_SELS:
         try:
-            await page.wait_for_selector(sel, timeout=18000)
+            await page.wait_for_selector(sel, timeout=12000)
+            # Save a one-time debug screenshot of the results page
+            if not _debug_saved:
+                _debug_saved = True
+                try:
+                    await page.screenshot(path="debug_results.png", full_page=False)
+                    html = await page.content()
+                    with open("debug_results.html", "w", encoding="utf-8") as f:
+                        f.write(html)
+                    print("    📄 Saved debug_results.png/.html (results page)")
+                except Exception:
+                    pass
             return True
         except PWTimeout:
             continue
+
     print(f"    ⚠ Nothing rendered: {label}")
     if not _debug_saved:
         _debug_saved = True
         try:
+            await page.screenshot(path="debug_results.png", full_page=False)
             html = await page.content()
-            with open("debug.html", "w", encoding="utf-8") as f:
+            with open("debug_results.html", "w", encoding="utf-8") as f:
                 f.write(html)
-            await page.screenshot(path="debug.png", full_page=True)
-            print("    📄 Saved debug.html and debug.png — share these to fix selectors")
+            print("    📄 Saved debug_results.png/.html — share these to fix selectors")
         except Exception as e:
             print(f"    (debug save failed: {e})")
     return False
@@ -136,86 +330,107 @@ async def get_cells(page):
             return cells
     return []
 
-# ── Core fetch: one route, one month → raw cell data ──────────────────────────
-async def fetch_month_raw(page, origin, dest, year, month):
-    """
-    Load the calendar and return a list of (day, points, tax) tuples
-    for every non-disabled cell. No filtering applied here.
-    """
-    url   = award_url(origin, dest, year, month)
-    label = f"{origin}→{dest} {MONTH_LABELS[(year,month)]}"
-    rows  = []
-    try:
-        await page.goto(url, wait_until="networkidle", timeout=60000)
-        if not await wait_for_page(page, label):
-            return rows
-        _, max_day = monthrange(year, month)
-        for cell in await get_cells(page):
-            try:
-                parsed = parse_cell((await cell.inner_text()).strip())
-                if not parsed:
-                    continue
-                day, pts, tax = parsed
-                if 1 <= day <= max_day:
-                    rows.append((day, pts, tax))
-            except Exception:
+async def parse_current_month(page, year, month):
+    """Extract (day, pts, tax) rows from whatever is currently rendered."""
+    rows = []
+    _, max_day = monthrange(year, month)
+    for cell in await get_cells(page):
+        try:
+            parsed = parse_cell((await cell.inner_text()).strip())
+            if not parsed:
                 continue
-    except PWTimeout:
-        print(f"    ✗ Timeout: {label}")
-    except Exception as e:
-        print(f"    ✗ Error {label}: {e}")
+            day, pts, tax = parsed
+            if 1 <= day <= max_day:
+                rows.append((day, pts, tax))
+        except Exception:
+            continue
     return rows
 
-# ── Two-pass logic per route ───────────────────────────────────────────────────
+# ── Route scraping ─────────────────────────────────────────────────────────────
 async def scrape_route(page, origin, dest, max_pts):
     """
     Two-pass scrape for one route direction.
-    Pass 1 — collect all raw cell data for every month,
-              find the absolute lowest points price across the whole date range,
-              capped at max_pts (the airport's threshold).
-    Pass 2 — using the cached raw data, record only dates where
-              points == absolute_min.
+
+    Pass 1 — Submit search once, then click Next Month through all months,
+              cache raw cell data for each.  Find absolute lowest price
+              within max_pts across the full date range.
+    Pass 2 — From the cache, record only dates where points == absolute_min.
+
     Returns:
         month_days : dict  { "Mar 2026": [1,3,5,...], ... }
-        abs_min    : int   absolute lowest points price (the consistent floor)
-        typical_tax: str   most common tax seen across all months
+        abs_min    : int   absolute lowest points price
+        typical_tax: str   most common tax seen
     """
     print(f"\n  ── {origin}→{dest} (threshold {max_pts:,}) ──")
-    # Pass 1: load and cache all months
-    cache = {}   # { (year,month): [(day,pts,tax), ...] }
+
+    first_year, first_month = MONTHS[0]
+
+    # ── Submit form for first month ───────────────────────────────────────────
+    print(f"    Submitting form... ", end="", flush=True)
+    ok = await fill_and_search(page, origin, dest, first_year, first_month)
+    if not ok:
+        return {lbl: "" for lbl in MONTH_LABELS.values()}, None, None
+
+    print("waiting for results... ", end="", flush=True)
+    if not await wait_for_results(page, f"{origin}→{dest} {MONTH_LABELS[MONTHS[0]]}"):
+        return {lbl: "" for lbl in MONTH_LABELS.values()}, None, None
+    print("ok")
+
+    # ── Pass 1: iterate through all months ────────────────────────────────────
+    cache    = {}
     all_pts  = []
     all_taxes = []
-    for year, month in MONTHS:
-        print(f"    Pass1 {MONTH_LABELS[(year,month)]} ...", end=" ")
-        raw = await fetch_month_raw(page, origin, dest, year, month)
+
+    for i, (year, month) in enumerate(MONTHS):
+        lbl   = MONTH_LABELS[(year, month)]
+        label = f"{origin}→{dest} {lbl}"
+        print(f"    Pass1 {lbl} ...", end=" ", flush=True)
+
+        if i > 0:
+            clicked = await click_next_month(page)
+            if clicked:
+                await asyncio.sleep(3)
+            else:
+                # Fallback: re-submit form for this month
+                print(f"(re-submitting) ", end="", flush=True)
+                await fill_and_search(page, origin, dest, year, month)
+                await wait_for_results(page, label)
+
+        raw = await parse_current_month(page, year, month)
         cache[(year, month)] = raw
-        for day, pts, tax in raw:
-            if pts <= max_pts:          # only consider prices within threshold
+
+        for _, pts, tax in raw:
+            if pts <= max_pts:
                 all_pts.append(pts)
             if tax:
                 all_taxes.append(tax)
-        found = [p for _, p, _ in raw if p <= max_pts]
-        print(f"eligible prices: {sorted(set(found))}")
-        await asyncio.sleep(1.2)
+
+        found = sorted(set(p for _, p, _ in raw if p <= max_pts))
+        print(f"eligible: {found}")
+        await asyncio.sleep(1)
+
     if not all_pts:
         print(f"    No availability within threshold for {origin}→{dest}")
         return {lbl: "" for lbl in MONTH_LABELS.values()}, None, None
-    abs_min = min(all_pts)
+
+    abs_min     = min(all_pts)
     typical_tax = max(set(all_taxes), key=all_taxes.count) if all_taxes else None
-    print(f"    → Absolute min price: {fmt_points(abs_min)}  Tax: {typical_tax}")
-    # Pass 2: record only dates matching abs_min exactly
+    print(f"    → Absolute min: {fmt_points(abs_min)}  Tax: {typical_tax}")
+
+    # ── Pass 2: filter from cache (no more navigation) ────────────────────────
     month_days = {}
     for year, month in MONTHS:
         lbl  = MONTH_LABELS[(year, month)]
-        days = [day for day, pts, _ in cache[(year, month)] if pts == abs_min]
+        days = [d for d, pts, _ in cache[(year, month)] if pts == abs_min]
         month_days[lbl] = days
         if days:
             print(f"    Pass2 {lbl}: {compress_days(days)}")
+
     return month_days, abs_min, typical_tax
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 async def run_all():
-    results = {}   # { iata: { col: value } }
+    results = {}
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         ctx = await browser.new_context(
@@ -226,23 +441,27 @@ async def run_all():
             )
         )
         page = await ctx.new_page()
+
         for iata, max_pts in AIRPORTS.items():
             print(f"\n{'='*60}")
             print(f"AIRPORT: {iata}  (threshold: {max_pts:,} pts)")
             print(f"{'='*60}")
             results[iata] = {}
-            # Direction D: origin → PHX
+
+            # Direction D: other airport → PHX
             days_d, min_d, tax_d = await scrape_route(page, iata, DESTINATION, max_pts)
             for lbl, days in days_d.items():
                 results[iata][f"{lbl} D"] = compress_days(days)
             results[iata]["pts_d"] = min_d
             results[iata]["tax_d"] = tax_d
-            # Direction R: PHX → origin
+
+            # Direction R: PHX → other airport
             days_r, min_r, tax_r = await scrape_route(page, DESTINATION, iata, max_pts)
             for lbl, days in days_r.items():
                 results[iata][f"{lbl} R"] = compress_days(days)
             results[iata]["pts_r"] = min_r
             results[iata]["tax_r"] = tax_r
+
         await browser.close()
     return results
 
@@ -252,6 +471,7 @@ def build_dataframe(results):
     for ym in MONTHS:
         lbl = MONTH_LABELS[ym]
         month_cols += [f"{lbl} D", f"{lbl} R"]
+
     rows = []
     for iata, data in results.items():
         row = {
@@ -269,6 +489,7 @@ def build_dataframe(results):
         row["Taxes (To PHX)"]    = data.get("tax_d") or ""
         row["Taxes (From PHX)"]  = data.get("tax_r") or ""
         rows.append(row)
+
     all_cols = (
         ["To", "From", "Alt Origins", "Feb 2026 D", "Feb 2026 R"]
         + month_cols
@@ -280,14 +501,13 @@ def build_dataframe(results):
 
 # ── Entry ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    total_fetches = len(AIRPORTS) * len(MONTHS) * 2   # x2 for two passes
     print("Alaska Airlines Award Scraper (two-pass consistent points)")
     print(f"Destination : {DESTINATION}")
     print(f"Airports    : {len(AIRPORTS)}")
-    print(f"Total fetches: {total_fetches}  (~{total_fetches * 3 // 60} min estimated)\n")
+    print(f"Routes      : {len(AIRPORTS) * 2} (each airport ↔ PHX)\n")
     data = asyncio.run(run_all())
     df   = build_dataframe(data)
-    out = "alaska_awards_PHX.csv"
+    out  = "alaska_awards_PHX.csv"
     df.to_csv(out, index=False)
     print(f"\n✅ Done! Saved to: {out}")
     preview = ["From", "Points (To PHX)", "Points (From PHX)",
