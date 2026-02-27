@@ -144,13 +144,13 @@ async def fill_and_search(page, origin, dest, year, month):
     # The Date field is a custom web component, NOT a plain <button>.
     global _datepicker_debug_saved
     try:
-        await page.locator(
-            "[role='button']:has-text('Date'), "
-            "div[slot]:has-text('Date'), "
-            "[class*='date' i][class*='field' i], "
-            "[class*='date' i][class*='input' i], "
-            "[class*='date' i][class*='trigger' i]"
-        ).first.click(timeout=3000)
+        # div[slot="trigger"] is the date picker trigger; inner span intercepts
+        # clicks so we must use force=True to bypass pointer-event blocking
+        date_trigger = page.locator("div[slot='trigger']").first
+        try:
+            await date_trigger.click(force=True, timeout=3000)
+        except Exception:
+            await date_trigger.dispatch_event("click")
         await asyncio.sleep(1.5)
 
         # Save one-time screenshot of the date picker
@@ -235,14 +235,19 @@ async def fill_and_search(page, origin, dest, year, month):
     await asyncio.sleep(0.5)
 
     # ── 5. Submit ─────────────────────────────────────────────────────────────
-    # Use direct .click(timeout=) — avoids is_visible race conditions
+    # Alaska web components have inner spans that intercept clicks;
+    # force=True bypasses pointer-event blocking.
     for submit_sel in [
         "button:has-text('Search flights')",
+        "[role='button']:has-text('Search flights')",
         "button[type='submit']",
-        "button:has-text('Search')",
     ]:
         try:
-            await page.locator(submit_sel).first.click(timeout=4000)
+            btn = page.locator(submit_sel).first
+            try:
+                await btn.click(force=True, timeout=4000)
+            except Exception:
+                await btn.dispatch_event("click")
             return True
         except Exception:
             continue
